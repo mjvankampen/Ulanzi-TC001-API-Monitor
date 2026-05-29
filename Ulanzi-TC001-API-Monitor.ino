@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <WiFiManager.h>
 #include <WebServer.h>
 #include <Adafruit_GFX.h>
@@ -86,6 +87,15 @@ String currentValue = "---";
 String lastError = "";
 unsigned long lastAPICall = 0;
 bool apiConfigured = false;
+
+// Ticker segments parsed from the AWTRIX-style payload: {"text":[{"t","c"}...],"repeat":N}
+#define MAX_SEGMENTS 48
+struct TickerSegment {
+  String text;
+  uint16_t color;
+};
+TickerSegment segments[MAX_SEGMENTS];
+int segmentCount = 0;
 
 // Authentication
 String adminPassword = "ulanzitc001"; // Default password
@@ -431,7 +441,7 @@ void loadConfiguration() {
 
   preferences.end();
   
-  apiConfigured = (apiEndpoint.length() > 0 && jsonPath.length() > 0);
+  apiConfigured = (apiEndpoint.length() > 0);  // ticker mode parses the whole payload; no JSON path needed
   
   // Apply brightness setting
   if (autoBrightness) {
@@ -676,6 +686,42 @@ void configModeCallback(WiFiManager *myWiFiManager) {
   scrollX = MATRIX_WIDTH;
 }
 
+// Convert "#RRGGBB" or "RRGGBB" into a NeoMatrix RGB565 color.
+uint16_t parseHexColor(const String& hex) {
+  String h = hex;
+  if (h.startsWith("#")) h = h.substring(1);
+  if (h.length() != 6) return matrix.Color(255, 255, 255);
+  long v = strtol(h.c_str(), NULL, 16);
+  return matrix.Color((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF);
+}
+
+// Parse the AWTRIX-style ticker payload into the segments[] array.
+bool parseTickerPayload(const String& json) {
+  DynamicJsonDocument doc(8192);
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) {
+    lastError = String("JSON: ") + err.c_str();
+    return false;
+  }
+
+  JsonArray text = doc["text"].as<JsonArray>();
+  if (text.isNull()) {
+    lastError = "No 'text' array";
+    return false;
+  }
+
+  segmentCount = 0;
+  for (JsonObject seg : text) {
+    if (segmentCount >= MAX_SEGMENTS) break;
+    segments[segmentCount].text = String((const char*)(seg["t"] | ""));
+    segments[segmentCount].color = parseHexColor(String((const char*)(seg["c"] | "#FFFFFF")));
+    segmentCount++;
+  }
+
+  lastError = "";
+  return segmentCount > 0;
+}
+
 void pollAPI() {
   if (!apiConfigured) {
     return;
@@ -696,8 +742,17 @@ void pollAPI() {
     String encodedUrl = urlEncode(apiEndpoint);
 
     HTTPClient http;
-    http.begin(encodedUrl);
+    WiFiClientSecure secureClient;
+    if (encodedUrl.startsWith("https")) {
+      secureClient.setInsecure();  // skip cert validation (fine for ngrok testing)
+      http.begin(secureClient, encodedUrl);
+    } else {
+      http.begin(encodedUrl);
+    }
     http.setTimeout(TIMEOUT_MS);
+
+    // ngrok free tier serves an HTML interstitial unless this header is present.
+    http.addHeader("ngrok-skip-browser-warning", "true");
 
     if (apiKey.length() > 0) {
       http.addHeader(apiHeaderName, apiKey);
@@ -714,24 +769,18 @@ void pollAPI() {
         String payload = http.getString();
         Serial.println("API Response received (" + String(payload.length()) + " bytes)");
         
-        String value = extractJSONValue(payload, jsonPath);
-        
-        if (value.length() > 0) {
-          currentValue = displayPrefix + value + displaySuffix;
-          lastError = "";
-          Serial.println("Extracted value: " + value);
-          Serial.println("Display value: " + currentValue);
+        if (parseTickerPayload(payload)) {
+          Serial.println("Parsed " + String(segmentCount) + " ticker segments");
           scrollX = MATRIX_WIDTH;
           success = true;
         } else {
-          currentValue = "PATH ERROR";
-          lastError = "Could not extract value from JSON path";
+          segmentCount = 0;  // error is rendered from lastError
           Serial.println("Error: " + lastError);
-          success = true; // Don't retry for JSON path errors
+          success = true; // Don't retry for parse errors
         }
       } else {
-        currentValue = "HTTP " + String(httpCode);
-        lastError = "HTTP error: " + String(httpCode);
+        segmentCount = 0;
+        lastError = "HTTP " + String(httpCode);
         Serial.println("HTTP error: " + String(httpCode));
         success = true; // Don't retry for HTTP errors (4xx, 5xx)
       }
@@ -739,11 +788,11 @@ void pollAPI() {
       // Network/timeout error - these we should retry
       String errorMsg = http.errorToString(httpCode);
       Serial.println("Connection failed: " + errorMsg);
-      
+
       if (retryCount == MAX_RETRIES) {
         // Final attempt failed
-        currentValue = "CONN FAIL";
-        lastError = errorMsg;
+        segmentCount = 0;
+        lastError = "CONN FAIL";
       }
     }
     
@@ -874,59 +923,40 @@ String extractJSONValue(const String& json, const String& path) {
 
 void scrollCurrentValue() {
   matrix.fillScreen(0);
-  
-  uint16_t color;
-  if (lastError.length() > 0) {
-    color = matrix.Color(255, 0, 0);
-  } else {
-    color = matrix.Color(0, 255, 0);
-  }
-  matrix.setTextColor(color);
-  
-  if (scrollEnabled) {
-    int iconOffset = iconEnabled ? (ICON_WIDTH + 1) : 0;
-    int16_t textWidth = currentValue.length() * 6;
-    
-    if (iconEnabled && scrollX < ICON_WIDTH) {
-      for (int y = 0; y < 8; y++) {
-        for (int x = 0; x < ICON_WIDTH; x++) {
-          if (scrollX + x >= 0 && scrollX + x < MATRIX_WIDTH) {
-            matrix.drawPixel(scrollX + x, y, iconPixels[y * 8 + x]);
-          }
-        }
-      }
-    }
-    
-    matrix.setCursor(scrollX + iconOffset, 0);
-    matrix.print(currentValue);
+
+  // Error state: scroll a single red message.
+  if (segmentCount == 0) {
+    String msg = lastError.length() > 0 ? lastError : currentValue;
+    matrix.setTextColor(matrix.Color(255, 0, 0));
+    matrix.setCursor(scrollX, 0);
+    matrix.print(msg);
     matrix.show();
-    
+    int16_t msgWidth = msg.length() * 6;
     scrollX--;
-    if (scrollX < -(textWidth + iconOffset)) {
-      scrollX = MATRIX_WIDTH;
-    }
-  } else {
-    int displayWidth = iconEnabled ? TEXT_WIDTH : MATRIX_WIDTH;
-    int xOffset = iconEnabled ? ICON_WIDTH : 0;
-    
-    if (iconEnabled) {
-      for (int y = 0; y < 8; y++) {
-        for (int x = 0; x < 8; x++) {
-          matrix.drawPixel(x, y, iconPixels[y * 8 + x]);
-        }
-      }
-    }
-    
-    int16_t x1, y1;
-    uint16_t w, h;
-    matrix.getTextBounds(currentValue.c_str(), 0, 0, &x1, &y1, &w, &h);
-    
-    int16_t centerX = xOffset + (displayWidth - w) / 2;
-    if (centerX < xOffset) centerX = xOffset;
-    
-    matrix.setCursor(centerX, 0);
-    matrix.print(currentValue);
-    matrix.show();
+    if (scrollX < -msgWidth) scrollX = MATRIX_WIDTH;
+    return;
+  }
+
+  // Classic GFX font is 6 px wide per character at text size 1.
+  int16_t totalWidth = 0;
+  for (int i = 0; i < segmentCount; i++) {
+    totalWidth += segments[i].text.length() * 6;
+  }
+
+  // Draw each coloured segment at its running offset, shifted by scrollX.
+  int16_t x = scrollX;
+  for (int i = 0; i < segmentCount; i++) {
+    matrix.setTextColor(segments[i].color);
+    matrix.setCursor(x, 0);
+    matrix.print(segments[i].text);
+    x += segments[i].text.length() * 6;
+  }
+  matrix.show();
+
+  // repeat = -1 in the payload means scroll forever, so we always wrap.
+  scrollX--;
+  if (scrollX < -totalWidth) {
+    scrollX = MATRIX_WIDTH;
   }
 }
 
@@ -1296,7 +1326,7 @@ void handleBackupRestore() {
   saveAPIConfiguration();
 
   // Update API configured flag
-  apiConfigured = (apiEndpoint.length() > 0 && jsonPath.length() > 0);
+  apiConfigured = (apiEndpoint.length() > 0);  // ticker mode parses the whole payload; no JSON path needed
 
   String response = "{\"success\":true,\"message\":\"Configuration restored successfully\"}";
   server.send(200, "application/json", response);
@@ -1797,7 +1827,7 @@ void handleSaveAPIConfig() {
   
   saveAPIConfiguration();
   
-  apiConfigured = (apiEndpoint.length() > 0 && jsonPath.length() > 0);
+  apiConfigured = (apiEndpoint.length() > 0);  // ticker mode parses the whole payload; no JSON path needed
   
   if (apiConfigured) {
     pollAPI();
